@@ -23,6 +23,14 @@
 (define-constant err-subscription-expired (err u113))
 (define-constant err-already-subscribed (err u114))
 (define-constant err-invalid-subscription-tier (err u115))
+(define-constant err-outfit-not-found (err u116))
+(define-constant err-not-outfit-owner (err u117))
+(define-constant err-invalid-outfit-items (err u118))
+(define-constant err-outfit-already-exists (err u119))
+(define-constant err-max-outfits-reached (err u120))
+(define-constant err-already-liked (err u121))
+(define-constant err-cannot-like-own-outfit (err u122))
+(define-constant err-invalid-visibility (err u123))
 
 (define-data-var last-token-id uint u0)
 (define-data-var contract-uri (string-ascii 256) "")
@@ -89,6 +97,41 @@
 
 (define-data-var rental-agreement-id uint u0)
 (define-data-var platform-fee-percentage uint u5)
+(define-data-var outfit-collection-id uint u0)
+
+(define-map outfit-collections uint {
+    creator: principal,
+    name: (string-ascii 64),
+    description: (string-ascii 256),
+    items: (list 10 uint),
+    created-at: uint,
+    public: bool,
+    likes: uint,
+    tags: (list 5 (string-ascii 16))
+})
+
+(define-map user-outfit-collections principal (list 20 uint))
+
+(define-map outfit-likes uint (list 100 principal))
+
+(define-map user-wardrobe principal {
+    total-items: uint,
+    collections-count: uint,
+    favorite-collection: (optional uint),
+    style-preferences: (list 5 (string-ascii 16))
+})
+
+(define-map outfit-analytics uint {
+    views: uint,
+    shares: uint,
+    item-combination-score: uint
+})
+
+(define-map trending-outfits uint {
+    outfit-id: uint,
+    trend-score: uint,
+    category: (string-ascii 32)
+})
 
 (define-public (initialize-contract (uri (string-ascii 256)))
     (begin
@@ -571,3 +614,290 @@
 (define-read-only (get-platform-fee-percentage)
     (ok (var-get platform-fee-percentage))
 )
+
+(define-public (create-outfit-collection 
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+    (items (list 10 uint))
+    (public bool)
+    (tags (list 5 (string-ascii 16)))
+)
+    (let (
+        (collection-id (+ (var-get outfit-collection-id) u1))
+        (current-collections (default-to (list) (map-get? user-outfit-collections tx-sender)))
+    )
+        (begin
+            (asserts! (> (len items) u0) err-invalid-outfit-items)
+            (asserts! (< (len current-collections) u20) err-max-outfits-reached)
+            (asserts! (validate-user-owns-items-check items tx-sender) err-invalid-outfit-items)
+            (map-set outfit-collections collection-id {
+                creator: tx-sender,
+                name: name,
+                description: description,
+                items: items,
+                created-at: stacks-block-height,
+                public: public,
+                likes: u0,
+                tags: tags
+            })
+            (map-set user-outfit-collections tx-sender 
+                (unwrap! (as-max-len? (append current-collections collection-id) u20) err-max-outfits-reached)
+            )
+            (let ((current-wardrobe (default-to { total-items: u0, collections-count: u0, favorite-collection: none, style-preferences: (list) } (map-get? user-wardrobe tx-sender))))
+                (map-set user-wardrobe tx-sender 
+                    (merge current-wardrobe { 
+                        collections-count: (+ (get collections-count current-wardrobe) u1)
+                    })
+                )
+            )
+            (map-set outfit-analytics collection-id {
+                views: u0,
+                shares: u0,
+                item-combination-score: (calculate-combination-score items)
+            })
+            (var-set outfit-collection-id collection-id)
+            (ok collection-id)
+        )
+    )
+)
+
+(define-public (update-outfit-collection 
+    (collection-id uint)
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+    (items (list 10 uint))
+    (public bool)
+    (tags (list 5 (string-ascii 16)))
+)
+    (let (
+        (collection (unwrap! (map-get? outfit-collections collection-id) err-outfit-not-found))
+    )
+        (begin
+            (asserts! (is-eq tx-sender (get creator collection)) err-not-outfit-owner)
+            (asserts! (> (len items) u0) err-invalid-outfit-items)
+            (asserts! (validate-user-owns-items-check items tx-sender) err-invalid-outfit-items)
+            (map-set outfit-collections collection-id 
+                (merge collection {
+                    name: name,
+                    description: description,
+                    items: items,
+                    public: public,
+                    tags: tags
+                })
+            )
+            (map-set outfit-analytics collection-id 
+                (merge (default-to { views: u0, shares: u0, item-combination-score: u0 } (map-get? outfit-analytics collection-id)) {
+                    item-combination-score: (calculate-combination-score items)
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (delete-outfit-collection (collection-id uint))
+    (let (
+        (collection (unwrap! (map-get? outfit-collections collection-id) err-outfit-not-found))
+        (user-collections (default-to (list) (map-get? user-outfit-collections tx-sender)))
+    )
+        (begin
+            (asserts! (is-eq tx-sender (get creator collection)) err-not-outfit-owner)
+            (map-delete outfit-collections collection-id)
+            (map-delete outfit-analytics collection-id)
+            (map-delete outfit-likes collection-id)
+            (map-set user-outfit-collections tx-sender 
+                (filter remove-collection-id user-collections)
+            )
+            (let ((current-wardrobe (default-to { total-items: u0, collections-count: u0, favorite-collection: none, style-preferences: (list) } (map-get? user-wardrobe tx-sender))))
+                (map-set user-wardrobe tx-sender 
+                    (merge current-wardrobe { 
+                        collections-count: (- (get collections-count current-wardrobe) u1),
+                        favorite-collection: (if (is-eq (get favorite-collection current-wardrobe) (some collection-id)) none (get favorite-collection current-wardrobe))
+                    })
+                )
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (like-outfit-collection (collection-id uint))
+    (let (
+        (collection (unwrap! (map-get? outfit-collections collection-id) err-outfit-not-found))
+        (current-likes (default-to (list) (map-get? outfit-likes collection-id)))
+        (analytics (default-to { views: u0, shares: u0, item-combination-score: u0 } (map-get? outfit-analytics collection-id)))
+    )
+        (begin
+            (asserts! (not (is-eq tx-sender (get creator collection))) err-cannot-like-own-outfit)
+            (asserts! (is-none (index-of current-likes tx-sender)) err-already-liked)
+            (asserts! (get public collection) err-outfit-not-found)
+            (map-set outfit-likes collection-id 
+                (unwrap! (as-max-len? (append current-likes tx-sender) u100) err-already-liked)
+            )
+            (map-set outfit-collections collection-id 
+                (merge collection { likes: (+ (get likes collection) u1) })
+            )
+            (update-trending-score collection-id (+ (get likes collection) u1))
+            (ok true)
+        )
+    )
+)
+
+(define-public (unlike-outfit-collection (collection-id uint))
+    (let (
+        (collection (unwrap! (map-get? outfit-collections collection-id) err-outfit-not-found))
+        (current-likes (default-to (list) (map-get? outfit-likes collection-id)))
+    )
+        (begin
+            (asserts! (is-some (index-of current-likes tx-sender)) err-outfit-not-found)
+            (map-set outfit-likes collection-id 
+                (filter remove-liker current-likes)
+            )
+            (map-set outfit-collections collection-id 
+                (merge collection { likes: (- (get likes collection) u1) })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (set-favorite-collection (collection-id uint))
+    (let (
+        (collection (unwrap! (map-get? outfit-collections collection-id) err-outfit-not-found))
+        (current-wardrobe (default-to { total-items: u0, collections-count: u0, favorite-collection: none, style-preferences: (list) } (map-get? user-wardrobe tx-sender)))
+    )
+        (begin
+            (asserts! (is-eq tx-sender (get creator collection)) err-not-outfit-owner)
+            (map-set user-wardrobe tx-sender 
+                (merge current-wardrobe { favorite-collection: (some collection-id) })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (view-outfit-collection (collection-id uint))
+    (let (
+        (collection (unwrap! (map-get? outfit-collections collection-id) err-outfit-not-found))
+        (analytics (default-to { views: u0, shares: u0, item-combination-score: u0 } (map-get? outfit-analytics collection-id)))
+    )
+        (begin
+            (asserts! (get public collection) err-outfit-not-found)
+            (map-set outfit-analytics collection-id 
+                (merge analytics { views: (+ (get views analytics) u1) })
+            )
+            (ok collection)
+        )
+    )
+)
+
+(define-public (share-outfit-collection (collection-id uint))
+    (let (
+        (collection (unwrap! (map-get? outfit-collections collection-id) err-outfit-not-found))
+        (analytics (default-to { views: u0, shares: u0, item-combination-score: u0 } (map-get? outfit-analytics collection-id)))
+    )
+        (begin
+            (asserts! (get public collection) err-outfit-not-found)
+            (map-set outfit-analytics collection-id 
+                (merge analytics { shares: (+ (get shares analytics) u1) })
+            )
+            (update-trending-score collection-id (+ (get shares analytics) u1))
+            (ok true)
+        )
+    )
+)
+
+(define-public (update-style-preferences (preferences (list 5 (string-ascii 16))))
+    (let (
+        (current-wardrobe (default-to { total-items: u0, collections-count: u0, favorite-collection: none, style-preferences: (list) } (map-get? user-wardrobe tx-sender)))
+    )
+        (begin
+            (map-set user-wardrobe tx-sender 
+                (merge current-wardrobe { style-preferences: preferences })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-private (validate-user-owns-items-check (items (list 10 uint)) (user principal))
+    (fold check-item-ownership items true)
+)
+
+(define-private (check-item-ownership (item uint) (acc bool))
+    (and acc (is-eq (nft-get-owner? wear-nft item) (some tx-sender)))
+)
+
+(define-private (calculate-combination-score (items (list 10 uint)))
+    (+ (* (len items) u10) u50)
+)
+
+(define-private (update-trending-score (collection-id uint) (new-score uint))
+    (let (
+        (trending-entry (default-to { outfit-id: collection-id, trend-score: u0, category: "general" } (map-get? trending-outfits collection-id)))
+    )
+        (map-set trending-outfits collection-id 
+            (merge trending-entry { trend-score: new-score })
+        )
+    )
+)
+
+(define-private (remove-collection-id (collection-id uint))
+    (not (is-eq collection-id collection-id))
+)
+
+(define-private (remove-liker (liker principal))
+    (not (is-eq liker tx-sender))
+)
+
+(define-read-only (get-outfit-collection (collection-id uint))
+    (map-get? outfit-collections collection-id)
+)
+
+(define-read-only (get-user-outfit-collections (user principal))
+    (default-to (list) (map-get? user-outfit-collections user))
+)
+
+(define-read-only (get-outfit-analytics (collection-id uint))
+    (map-get? outfit-analytics collection-id)
+)
+
+(define-read-only (get-outfit-likes (collection-id uint))
+    (default-to (list) (map-get? outfit-likes collection-id))
+)
+
+(define-read-only (get-user-wardrobe (user principal))
+    (map-get? user-wardrobe user)
+)
+
+(define-read-only (get-trending-outfits)
+    (ok "Use get-trending-outfit with specific collection-id")
+)
+
+(define-read-only (get-trending-outfit (collection-id uint))
+    (map-get? trending-outfits collection-id)
+)
+
+(define-read-only (is-collection-public (collection-id uint))
+    (match (map-get? outfit-collections collection-id)
+        collection (ok (get public collection))
+        (err err-outfit-not-found)
+    )
+)
+
+(define-read-only (get-collection-likes-count (collection-id uint))
+    (match (map-get? outfit-collections collection-id)
+        collection (ok (get likes collection))
+        (err err-outfit-not-found)
+    )
+)
+
+(define-read-only (has-user-liked-collection (collection-id uint) (user principal))
+    (let (
+        (likes (default-to (list) (map-get? outfit-likes collection-id)))
+    )
+        (ok (is-some (index-of likes user)))
+    )
+)
+
+
