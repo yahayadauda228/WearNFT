@@ -9,6 +9,11 @@ requirements = []
 path = 'contracts/WearNFT.clar'
 clarity_version = 3
 epoch = 3.1
+
+[contracts.product-reviews]
+path = 'contracts/product-reviews.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
